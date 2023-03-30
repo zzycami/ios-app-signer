@@ -24,7 +24,9 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     @IBOutlet var appShortVersion: NSTextField!
     @IBOutlet var appVersion: NSTextField!
     @IBOutlet var ignorePluginsCheckbox: NSButton!
+    @IBOutlet var noGetTaskAllowCheckbox: NSButton!
 
+    
     //MARK: Variables
     var provisioningProfiles:[ProvisioningProfile] = []
     @objc var codesigningCerts: [String] = []
@@ -35,7 +37,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     var startSize: CGFloat?
     @objc var NibLoaded = false
     var shouldCheckPlugins: Bool!
-    
+    var shouldSkipGetTaskAllow: Bool!
+
     //MARK: Constants
     let signableExtensions = ["dylib","so","0","vis","pvr","framework","appex","app"]
     @objc let defaults = UserDefaults()
@@ -265,7 +268,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 output.append(rawResult[index+1])
             }
         }
-        return output
+        return output.sorted()
     }
     
     @objc func showCodesignCertsErrorAlert(){
@@ -434,12 +437,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         return "\(size)B"
     }
     @objc func getPlistKey(_ plist: String, keyName: String)->String? {
-        let currTask = Process().execute(defaultsPath, workingDirectory: nil, arguments: ["read", plist, keyName])
-        if currTask.status == 0 {
-            return String(currTask.output.dropLast())
-        } else {
-            return nil
-        }
+        let dictionary = NSDictionary(contentsOfFile: plist);
+        return dictionary?[keyName] as? String
     }
     
     func setPlistKey(_ plist: String, keyName: String, value: String)->AppSignerTaskOutput {
@@ -504,13 +503,17 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             beforeFunc(file, certificate, entitlements)
         }
 
-        var arguments = ["-f", "-s", certificate]
+        var arguments = ["-f", "-s", certificate, "--generate-entitlement-der"]
         if needEntitlements {
             arguments += ["--entitlements", entitlements!]
         }
         arguments.append(filePath)
 
         let codesignTask = Process().execute(codesignPath, workingDirectory: nil, arguments: arguments)
+        if codesignTask.status != 0 {
+            Log.write("Error codesign: \(codesignTask.output)")
+        }
+        
         if let afterFunc = after {
             afterFunc(file, certificate, entitlements, codesignTask)
         }
@@ -527,6 +530,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             let verificationTask = Process().execute(codesignPath, workingDirectory: nil, arguments: ["-v",codesignTempFile])
             try? fileManager.removeItem(atPath: codesignTempFile)
             if verificationTask.status == 0 {
+                Log.write("Error testing codesign: \(verificationTask.output)")
                 return true
             } else {
                 return false
@@ -579,6 +583,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             newShortVersion = self.appShortVersion.stringValue.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             newVersion = self.appVersion.stringValue.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             shouldCheckPlugins = ignorePluginsCheckbox.state == .off
+            shouldSkipGetTaskAllow = noGetTaskAllowCheckbox.state == .on
         }
 
         var provisioningFile = self.profileFilename
@@ -854,19 +859,32 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                     }
                 }
                 
+                let bundleID = getPlistKey(appBundleInfoPlist, keyName: "CFBundleIdentifier")
+                
                 //MARK: Generate entitlements.plist
                 if provisioningFile != nil || useAppBundleProfile {
                     setStatus("Parsing entitlements")
                     
-                    if let profile = ProvisioningProfile(filename: useAppBundleProfile ? appBundleProvisioningFilePath : provisioningFile!){
-                        if var entitlements = profile.getEntitlementsPlist(tempFolder) {
-                            if let oldAppID = getPlistKey(appBundleInfoPlist, keyName: "CFBundleIdentifier"){
-                                entitlements = entitlements.replacingOccurrences(of: "*", with: oldAppID) as NSString
+                    if var profile = ProvisioningProfile(filename: useAppBundleProfile ? appBundleProvisioningFilePath : provisioningFile!){
+                        if shouldSkipGetTaskAllow {
+                            profile.removeGetTaskAllow()
+                        }
+                        let isWildcard = profile.appID == "*" // TODO: support com.example.* wildcard
+                        if !isWildcard && (newApplicationID != "" && newApplicationID != profile.appID) {
+                            setStatus("Unable to change App ID to \(newApplicationID), provisioning profile won't allow it")
+                            cleanup(tempFolder); return
+                        } else if isWildcard {
+                            if newApplicationID != "" {
+                                profile.update(trueAppID: newApplicationID)
+                            } else if let existingBundleID = bundleID {
+                                profile.update(trueAppID: existingBundleID)
                             }
+                        }
+                        if let entitlements = profile.getEntitlementsPlist() {
                             Log.write("–––––––––––––––––––––––\n\(entitlements)")
                             Log.write("–––––––––––––––––––––––")
                             do {
-                                try entitlements.write(toFile: entitlementsPlist, atomically: false, encoding: String.Encoding.utf8.rawValue)
+                                try entitlements.write(toFile: entitlementsPlist, atomically: false, encoding: .utf8)
                                 setStatus("Saved entitlements to \(entitlementsPlist)")
                             } catch let error as NSError {
                                 setStatus("Error writing entitlements.plist, \(error.localizedDescription)")
@@ -874,10 +892,6 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                         } else {
                             setStatus("Unable to read entitlements from provisioning profile")
                             warnings += 1
-                        }
-                        if profile.appID != "*" && (newApplicationID != "" && newApplicationID != profile.appID) {
-                            setStatus("Unable to change App ID to \(newApplicationID), provisioning profile won't allow it")
-                            cleanup(tempFolder); return
                         }
                     } else {
                         setStatus("Unable to parse provisioning profile, it may be corrupt")
@@ -894,7 +908,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 //MARK: Change Application ID
                 if newApplicationID != "" {
                     
-                    if let oldAppID = getPlistKey(appBundleInfoPlist, keyName: "CFBundleIdentifier") {
+                    if let oldAppID = bundleID {
                         func changeAppexID(_ appexFile: String){
                             guard allowRecursiveSearchAt(appexFile.stringByDeletingLastPathComponent) else {
                                 return
